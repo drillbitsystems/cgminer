@@ -16,6 +16,7 @@
 #include "sha2.h"
 
 #define TIMEOUT 3000
+#define RESULT_TIMEOUT 5000
 #define MAX_RESULTS 16 // max results from a single chip
 
 #define drvlog(prio, fmt, ...) do { \
@@ -52,26 +53,44 @@ typedef struct {
 #define SZ_SERIALISED_WORKRESULT (4+4*MAX_RESULTS)
 static void deserialise_work_result(WorkResult *work_result, const char *buf);
 
+/* V4 config is the preferred one, used internally, non-ASIC-specific */
+typedef struct {
+	uint16_t core_voltage; // Millivolts
+	uint16_t clock_freq; // Clock frequency in MHz (or clock level 30-48 for Bitfury internal clock level)
+	uint8_t clock_div2;	 // Apply the /2 clock divider (both internal and external), where available
+	uint8_t use_ext_clock; // Flag. Ignored on boards without external clocks
+} BoardConfig;
+
+typedef struct
+{
+	uint16_t chip_id;
+	uint8_t increase_clock;
+} AutoTuneRequest;
+
+#define SZ_SERIALISED_AUTOTUNEREQUEST 3
+static void serialise_autotune_request(char *buf, AutoTuneRequest *aq);
+
 #define CONFIG_PW1 (1<<0)
 #define CONFIG_PW2 (1<<1)
 
-// Possible core voltage settings on PW1 & PW2
+// Possible core voltage settings on PW1 & PW2, used by legacy V3 config only
 #define CONFIG_CORE_065V 0
 #define CONFIG_CORE_075V CONFIG_PW2
 #define CONFIG_CORE_085V CONFIG_PW1
 #define CONFIG_CORE_095V (CONFIG_PW1|CONFIG_PW2)
 
+/* V3 config is for backwards compatibility with older firmwares */
 typedef struct {
 	uint8_t core_voltage; // Set to flags defined above
 	uint8_t int_clock_level; // Clock level (30-48 without divider), see asic.c for details
-	uint8_t clock_div2;	 // Apply the /2 clock divider (both internal and external)
+	uint8_t clock_div2;	// Apply the /2 clock divider (both internal and external)
 	uint8_t use_ext_clock; // Ignored on boards without external clocks
 	uint16_t ext_clock_freq;
-	uint16_t core_voltage_mv; // set to a plain human-readable integer value (not serialised atm)
-} BoardConfig;
+ } BoardConfigV3;
 
 #define SZ_SERIALISED_BOARDCONFIG 6
-static void serialise_board_config(char *buf, const BoardConfig *boardconfig);
+static void serialise_board_configV4(char *buf, BoardConfig *boardconfig);
+static void serialise_board_configV3(char *buf, BoardConfigV3 *boardconfig);
 
 typedef struct {
 	uint8_t protocol_version;
@@ -84,6 +103,7 @@ typedef struct {
 /* Capabilities flags known to cgminer */
 #define CAP_TEMP 1
 #define CAP_EXT_CLOCK 2
+#define CAP_IS_AVALON 4
 
 #define SZ_SERIALISED_IDENTITY 16
 static void deserialise_identity(Identity *identity, const char *buf);
@@ -94,19 +114,6 @@ typedef struct {
 	BoardConfig config;
 	UT_hash_handle hh;
 } config_setting;
-
-/* Comparatively modest default settings */
-static config_setting default_settings = {
-	key: { 0 },
-	config: {
-		core_voltage: CONFIG_CORE_085V,
-		core_voltage_mv: 850,
-		use_ext_clock: 0,
-		int_clock_level: 40,
-		clock_div2: 0,
-		ext_clock_freq: 200
-	},
-};
 
 static config_setting *settings;
 
@@ -246,7 +253,7 @@ static bool drillbit_getinfo(struct cgpu_info *drillbit, struct drillbit_info *i
 	}
 
 	const int MIN_VERSION = 2;
-	const int MAX_VERSION = 3;
+	const int MAX_VERSION = 4;
 	if (identity.protocol_version < MIN_VERSION) {
 		drvlog(LOG_ERR, "Unknown device protocol version %d.", identity.protocol_version);
 		return false;
@@ -262,7 +269,7 @@ static bool drillbit_getinfo(struct cgpu_info *drillbit, struct drillbit_info *i
 	}
 
 	// load identity data into device info structure
-	info->version = identity.protocol_version;
+	info->protocol_version = identity.protocol_version;
 	if (strncmp(identity.product, "DRILLBIT", sizeof(identity.product)) == 0) {
 		// Hack: first production firmwares all described themselves as DRILLBIT, so fill in the gaps
 		if (identity.num_chips == 1)
@@ -277,7 +284,7 @@ static bool drillbit_getinfo(struct cgpu_info *drillbit, struct drillbit_info *i
 	info->capabilities = identity.capabilities;
 
 	drvlog(LOG_INFO, "Getinfo returned version %d, product %s serial %08x num_chips %d",
-	       info->version, info->product, info->serial, info->num_chips);
+	       info->protocol_version, info->product, info->serial, info->num_chips);
 
 	drillbit_empty_buffer(drillbit);
 	return true;
@@ -313,11 +320,17 @@ static config_setting *find_settings(struct cgpu_info *drillbit)
 	config_setting *setting;
 	char search_key[9];
 
-	// Search by serial (8 character hex string)
+	if(!settings) {
+		drvlog(LOG_INFO, "Keeping onboard defaults for device %s (serial %08x)",
+			info->product, info->serial);
+		return NULL;
+	}
+
+	// Search by serial
 	sprintf(search_key, "%08x", info->serial);
 	HASH_FIND_STR(settings, search_key, setting);
 	if (setting) {
-		drvlog(LOG_INFO, "Using unit-specific settings for serial %s", search_key);
+		drvlog(LOG_INFO, "Using serial specific settings for serial %s", search_key);
 		return setting;
 	}
 
@@ -344,45 +357,66 @@ static config_setting *find_settings(struct cgpu_info *drillbit)
 		return setting;
 	}
 
-	// Failing that, return default/generic config (null key)
+	// Check for a generic/catchall drillbit-options argument (key set to NULL)
 	search_key[0] = 0;
 	HASH_FIND_STR(settings, search_key, setting);
-	drvlog(LOG_INFO, "Using non-specific settings for device %s (serial %08x)", info->product,
-	       info->serial);
-	return setting;
+	if (setting) {
+		drvlog(LOG_INFO, "Using non-specific settings for device %s (serial %08x)", info->product,
+			info->serial);
+		return setting;
+	}
+
+	drvlog(LOG_WARNING, "Keeping onboard defaults for device %s (serial %08x)",
+		info->product, info->serial);
+	return NULL;
 }
 
 static void drillbit_send_config(struct cgpu_info *drillbit)
 {
 	struct drillbit_info *info = drillbit->device_data;
-	char cmd;
 	int amount;
-	char buf[SZ_SERIALISED_BOARDCONFIG];
+	char buf[SZ_SERIALISED_BOARDCONFIG+1];
 	config_setting *setting;
+	BoardConfigV3 v3_config;
 
 	// Find the relevant board config
 	setting = find_settings(drillbit);
+	if(!setting)
+		return; // Don't update board config from defaults
 	drvlog(LOG_NOTICE, "Config: %s:%d:%d:%d Serial: %08x",
 	       setting->config.use_ext_clock ? "ext" : "int",
-	       setting->config.use_ext_clock ? setting->config.ext_clock_freq : setting->config.int_clock_level,
+	       setting->config.clock_freq,
 	       setting->config.clock_div2 ? 2 : 1,
-	       setting->config.core_voltage_mv,
+	       setting->config.core_voltage,
 	       info->serial);
-
-	drvlog(LOG_INFO, "Sending board configuration voltage=%d use_ext_clock=%d int_clock_level=%d clock_div2=%d ext_clock_freq=%d",
-	       setting->config.core_voltage, setting->config.use_ext_clock,
-	       setting->config.int_clock_level,
-	       setting->config.clock_div2, setting->config.ext_clock_freq);
 
 	if (setting->config.use_ext_clock && !(info->capabilities & CAP_EXT_CLOCK)) {
 		drvlog(LOG_WARNING, "Chosen configuration specifies external clock but this device (serial %08x) has no external clock!", info->serial);
 	}
 
-	cmd = 'C';
-	usb_write_timeout(drillbit, &cmd, 1, &amount, TIMEOUT, C_BF_REQWORK);
-
-	serialise_board_config(buf, &setting->config);
-	usb_write_timeout(drillbit, buf, SZ_SERIALISED_BOARDCONFIG, &amount, TIMEOUT, C_BF_CONFIG);
+	if(info->protocol_version <= 3) {
+		/* Make up a backwards compatible V3 config structure to send to the miner */
+		if(setting->config.core_voltage >= 950)
+			v3_config.core_voltage = CONFIG_CORE_095V;
+		else if (setting->config.core_voltage >= 850)
+			v3_config.core_voltage = CONFIG_CORE_085V;
+		else if (setting->config.core_voltage >= 750)
+			v3_config.core_voltage = CONFIG_CORE_075V;
+		else
+			v3_config.core_voltage = CONFIG_CORE_065V;
+		if(setting->config.clock_freq > 64)
+			v3_config.int_clock_level = setting->config.clock_freq / 5;
+		else
+			v3_config.int_clock_level = setting->config.clock_freq;
+		v3_config.clock_div2 = setting->config.clock_div2;
+		v3_config.use_ext_clock = setting->config.use_ext_clock;
+		v3_config.ext_clock_freq = setting->config.clock_freq;
+		serialise_board_configV3(&buf[1], &v3_config);
+	} else {
+		serialise_board_configV4(&buf[1], &setting->config);
+	}
+	buf[0] = 'C';
+	usb_write_timeout(drillbit, buf, sizeof(buf), &amount, TIMEOUT, C_BF_CONFIG);
 
 	/* Expect a single 'C' byte as acknowledgement */
 	usb_read_simple_response(drillbit, 'C', C_BF_CONFIG); // TODO: verify response
@@ -443,9 +477,6 @@ static bool drillbit_parse_options(struct cgpu_info *drillbit)
 	if (settings != NULL)
 		return true; // Already initialised
 
-	// Start with the system-wide defaults
-	HASH_ADD_STR(settings, key, (&default_settings));
-
 	char *next_opt = opt_drillbit_options;
 	while (next_opt && strlen(next_opt)) {
 		BoardConfig parsed_config;
@@ -473,42 +504,13 @@ static bool drillbit_parse_options(struct cgpu_info *drillbit)
 
 		if (!strcmp("int",clksrc)) {
 			parsed_config.use_ext_clock = 0;
-			if (freq < 0 || freq > 63) {
-				quithere(1, "Invalid internal oscillator level %d. Recommended range is %s for this clock divider (possible is 0-63)", freq, parsed_config.clock_div2 ? "48-57":"30-48");
-			}
-			if (parsed_config.clock_div2 && (freq < 48 || freq > 57)) {
-				drvlog(LOG_WARNING, "Internal oscillator level %d outside recommended range 48-57.", freq);
-			}
-			if (!parsed_config.clock_div2 && (freq < 30 || freq > 48)) {
-				drvlog(LOG_WARNING, "Internal oscillator level %d outside recommended range 30-48.", freq);
-			}
-			parsed_config.int_clock_level = freq;
-		} else if (!strcmp("ext", clksrc)) {
+		}
+		else if (!strcmp("ext", clksrc)) {
 			parsed_config.use_ext_clock = 1;
-			parsed_config.ext_clock_freq = freq;
-			if (freq < 80 || freq > 230) {
-				drvlog(LOG_WARNING, "Warning: recommended external clock frequencies are 80-230MHz. Value %d may produce unexpected results.", freq);
-			}
 		} else
 			quithere(1, "Invalid clock source. Valid choices are int, ext.");
 
-		parsed_config.core_voltage_mv = voltage;
-		switch(voltage) {
-		case 650:
-			voltage = CONFIG_CORE_065V;
-			break;
-		case 750:
-			voltage = CONFIG_CORE_075V;
-			break;
-		case 850:
-			voltage = CONFIG_CORE_085V;
-			break;
-		case 950:
-			voltage = CONFIG_CORE_095V;
-			break;
-		default:
-			quithere(1, "Invalid core voltage %d. Valid values 650,750,850,950mV)", voltage);
-		}
+		parsed_config.clock_freq = freq;
 		parsed_config.core_voltage = voltage;
 
 		// Add the new set of settings to the configuration choices hash table
@@ -621,16 +623,64 @@ static const uint32_t bf_offsets[] = {-0x800000, 0, -0x400000};
 
 static bool drillbit_checkresults(struct thr_info *thr, struct work *work, uint32_t nonce)
 {
+	struct cgpu_info *drillbit = thr->cgpu;
+	struct drillbit_info *info = drillbit->device_data;
 	int i;
 
-	nonce = decnonce(nonce);
-	for (i = 0; i < BF_OFFSETS; i++) {
-		if (test_nonce(work, nonce + bf_offsets[i])) {
+	if(info->capabilities & CAP_IS_AVALON) {
+		if (test_nonce(work, nonce)) {
 			submit_tested_work(thr, work);
 			return true;
 		}
 	}
+	else { /* Bitfury */
+		nonce = decnonce(nonce);
+		for (i = 0; i < BF_OFFSETS; i++) {
+			if (test_nonce(work, nonce + bf_offsets[i])) {
+				submit_tested_work(thr, work);
+				return true;
+			}
+		}
+	}
 	return false;
+}
+
+/* Check if this ASIC should be tweaked up or down in clock speed */
+static void drillbit_check_autotune(struct thr_info *thr, struct drillbit_chip_info *chip)
+{
+	struct cgpu_info *drillbit = thr->cgpu;
+	AutoTuneRequest request;
+	char buf[SZ_SERIALISED_AUTOTUNEREQUEST+1];
+	int amount;
+	float ratio;
+
+	/* autotune tries to keep ratio of HW errors within these margins:
+	   every RETUNE_EVERY results (errors and successes totalled, error count should be between
+	   the low and high limits given.
+	*/
+	const uint32_t TUNE_UP_EVERY = 100;
+	const uint32_t ERROR_LOW = 1;
+	const uint32_t ERROR_HIGH = 3;
+
+	/* Check auto parameters */
+	if(chip->success_auto + chip->error_auto < TUNE_UP_EVERY && chip->error_auto < ERROR_HIGH*2)
+		return;
+
+	ratio = 100 * (float)chip->error_auto / (chip->success_auto + chip->error_auto);
+	applog(LOG_DEBUG, "Chip id %d has error ratio %3.1f%%", chip->chip_id, ratio);
+
+	if(chip->error_auto < ERROR_LOW || chip->error_auto > ERROR_HIGH) {
+		/* Value should be tweaked */
+		buf[0] = 'A';
+		request.chip_id = chip->chip_id;
+		request.increase_clock = chip->error_auto < ERROR_LOW;
+		serialise_autotune_request(&buf[1], &request);
+		usb_write_timeout(drillbit, buf, sizeof(buf), &amount, TIMEOUT, C_BF_AUTOTUNE);
+		usb_read_simple_response(drillbit, 'A', C_BF_AUTOTUNE);
+	}
+
+	chip->success_auto = 0;
+	chip->error_auto = 0;
 }
 
 // Check and submit back any pending work results from firmware,
@@ -707,35 +757,39 @@ static int check_for_results(struct thr_info *thr)
 			drvlog(LOG_ERR, "Got invalid number of result nonces (%d) for chip id %d", response->num_nonces, response->chip_id);
 			goto cleanup;
 		}
-		for (i = 0; i < response->num_nonces; i++) {
+
+		for(i = 0; i < response->num_nonces; i++) {
 			if (unlikely(thr->work_restart))
 				goto cleanup;
 			found = false;
-			for (k = 0; k < WORK_HISTORY_LEN; k++) {
+			for(k = 0; k < WORK_HISTORY_LEN; k++) {
 				/* NB we deliberately check all results against all work because sometimes ASICs seem to give multiple "valid" nonces,
 				   and this seems to avoid some result that would otherwise be rejected by the pool.
-
-				   However we only count one success per result set to avoid artificially inflating the hashrate.
-				   A smarter thing to do here might be to look at the full set of nonces in the response and start from the "best" one first.
 				*/
 				if (chip->current_work[k] && drillbit_checkresults(thr, chip->current_work[k], response->nonce[i])) {
 					if (!found) {
 						chip->success_count++;
+						chip->success_auto++;
 						successful_results++;
 						found = true;
 					}
 				}
 			}
-			if (!found && chip->state != IDLE) {
-				/* all nonces we got back from this chip were invalid */
-				inc_hw_errors(thr);
-				chip->error_count++;
-			}
 		}
-		if (chip->state == WORKING_QUEUED && !response->is_idle)
+		drvlog(LOG_DEBUG, "%s nonce %08x", (found ? "Good":"Bad"), response->num_nonces ? response->nonce[0] : 0);
+		if(!found && chip->state != IDLE && response->num_nonces > 0) {
+			/* all nonces we got back from this chip were invalid */
+			inc_hw_errors(thr);
+			chip->error_count++;
+			chip->error_auto++;
+		}
+		if(chip->state == WORKING_QUEUED && !response->is_idle)
 			chip->state = WORKING_NOQUEUED; // Time to queue up another piece of "next work"
 		else
 			chip->state = IDLE; // Uh-oh, we're totally out of work for this ASIC!
+
+		if(opt_drillbit_autotune && info->protocol_version >= 4)
+			drillbit_check_autotune(thr, chip);
 	}
 
 cleanup:
@@ -749,8 +803,7 @@ static void drillbit_send_work_to_chip(struct thr_info *thr, struct drillbit_chi
 {
 	struct cgpu_info *drillbit = thr->cgpu;
 	struct work *work;
-	char cmd;
-	char buf[SZ_SERIALISED_WORKREQUEST];
+	char buf[SZ_SERIALISED_WORKREQUEST+1];
 	int amount, i;
 
 	/* Get some new work for the chip */
@@ -761,12 +814,11 @@ static void drillbit_send_work_to_chip(struct thr_info *thr, struct drillbit_chi
 	}
 
 	drvlog(LOG_DEBUG, "Sending work to chip_id %d", chip->chip_id);
-	serialise_work_request(buf, chip->chip_id, work);
+	serialise_work_request(&buf[1], chip->chip_id, work);
 
 	/* Send work to cgminer */
-	cmd = 'W';
-	usb_write_timeout(drillbit, &cmd, 1, &amount, TIMEOUT, C_BF_REQWORK);
-	usb_write_timeout(drillbit, buf, SZ_SERIALISED_WORKREQUEST, &amount, TIMEOUT, C_BF_REQWORK);
+	buf[0] = 'W';
+	usb_write_timeout(drillbit, buf, sizeof(buf), &amount, TIMEOUT, C_BF_REQWORK);
 
 	/* Expect a single 'W' byte as acknowledgement */
 	usb_read_simple_response(drillbit, 'W', C_BF_REQWORK);
@@ -815,12 +867,13 @@ static int64_t drillbit_scanwork(struct thr_info *thr)
 		if (info->chips[i].state == IDLE)
 			continue;
 		ms_diff = ms_tdiff(&tv_now, &info->chips[i].tv_start);
-		if (ms_diff > TIMEOUT) {
-			if (info->chips[i].work_sent_count > 4) {
+		if(ms_diff > RESULT_TIMEOUT) {
+			if(info->chips[i].work_sent_count > 4) {
 				/* Only count ASIC timeouts after the pool has started to send work in earnest,
 				   some pools can create unusual delays early on */
 				drvlog(LOG_ERR, "Timing out unresponsive ASIC %d", info->chips[i].chip_id);
 				info->chips[i].timeout_count++;
+				info->chips[i].error_auto++;
 			}
 			info->chips[i].state = IDLE;
 			drillbit_send_work_to_chip(thr, &info->chips[i]);
@@ -882,7 +935,7 @@ static struct api_data *drillbit_api_stats(struct cgpu_info *cgpu)
 	char serial[16];
 	int version;
 
-	version = info->version;
+	version = info->protocol_version;
 	root = api_add_int(root, "Protocol Version", &version, true);
 	root = api_add_string(root, "Product", info->product, false);
 	sprintf(serial, "%08x", info->serial);
@@ -961,7 +1014,7 @@ static void deserialise_work_result(WorkResult *wr, const char *buf)
 		DESERIALISE(wr->nonce[i]);
 }
 
-static void serialise_board_config(char *buf, const BoardConfig *bc)
+static void serialise_board_configV3(char *buf, BoardConfigV3 *bc)
 {
 	size_t offset = 0;
 	SERIALISE(bc->core_voltage);
@@ -969,6 +1022,22 @@ static void serialise_board_config(char *buf, const BoardConfig *bc)
 	SERIALISE(bc->clock_div2);
 	SERIALISE(bc->use_ext_clock);
 	SERIALISE(bc->ext_clock_freq);
+}
+
+static void serialise_board_configV4(char *buf, BoardConfig *bc)
+{
+	size_t offset = 0;
+	SERIALISE(bc->core_voltage);
+	SERIALISE(bc->clock_freq);
+	SERIALISE(bc->clock_div2);
+	SERIALISE(bc->use_ext_clock);
+}
+
+static void serialise_autotune_request(char *buf, AutoTuneRequest *aq)
+{
+	size_t offset = 0;
+	SERIALISE(aq->chip_id);
+	SERIALISE(aq->increase_clock);
 }
 
 static void deserialise_identity(Identity *id, const char *buf)

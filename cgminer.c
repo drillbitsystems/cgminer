@@ -6285,6 +6285,7 @@ static void pool_resus(struct pool *pool)
 }
 
 static bool work_filled;
+static bool work_emptied;
 
 /* If this is called non_blocking, it will return NULL for work so that must
  * be handled. */
@@ -6301,6 +6302,7 @@ static struct work *hash_pop(bool blocking)
 			opt_queue++;
 			work_filled = false;
 		}
+		work_emptied = true;
 		if (!blocking)
 			goto out_unlock;
 		do {
@@ -8975,6 +8977,10 @@ begin_bench:
 
 		/* Wait until hash_pop tells us we need to create more work */
 		if (ts > max_staged) {
+			if (work_emptied) {
+				opt_queue++;
+				work_emptied = false;
+			}
 			work_filled = true;
 			pthread_cond_wait(&gws_cond, stgd_lock);
 			ts = __total_staged();
@@ -8985,6 +8991,10 @@ begin_bench:
 			/* Keeps slowly generating work even if it's not being
 			 * used to keep last_getwork incrementing and to see
 			 * if pools are still alive. */
+			if (work_emptied) {
+				opt_queue++;
+				work_emptied = false;
+			}
 			work_filled = true;
 			work = hash_pop(false);
 			if (work)

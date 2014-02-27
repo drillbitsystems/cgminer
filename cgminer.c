@@ -6284,6 +6284,8 @@ static void pool_resus(struct pool *pool)
 		applog(LOG_INFO, "Pool %d %s alive", pool->pool_no, pool->rpc_url);
 }
 
+static bool work_filled;
+
 /* If this is called non_blocking, it will return NULL for work so that must
  * be handled. */
 static struct work *hash_pop(bool blocking)
@@ -6293,6 +6295,12 @@ static struct work *hash_pop(bool blocking)
 
 	mutex_lock(stgd_lock);
 	if (!HASH_COUNT(staged_work)) {
+		/* Increase the queue if we reach zero and we know we can reach
+		 * the maximum we're asking for. */
+		if (work_filled) {
+			opt_queue++;
+			work_filled = false;
+		}
 		if (!blocking)
 			goto out_unlock;
 		do {
@@ -8966,6 +8974,7 @@ begin_bench:
 
 		/* Wait until hash_pop tells us we need to create more work */
 		if (ts > max_staged) {
+			work_filled = true;
 			pthread_cond_wait(&gws_cond, stgd_lock);
 			ts = __total_staged();
 		}
@@ -8975,6 +8984,7 @@ begin_bench:
 			/* Keeps slowly generating work even if it's not being
 			 * used to keep last_getwork incrementing and to see
 			 * if pools are still alive. */
+			work_filled = true;
 			work = hash_pop(false);
 			if (work)
 				discard_work(work);

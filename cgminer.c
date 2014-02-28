@@ -8897,6 +8897,7 @@ int main(int argc, char *argv[])
 		if (!use_curses)
 			early_quit(0, "No servers could be used! Exiting.");
 #ifdef HAVE_CURSES
+		wrefresh(logwin);
 		halfdelay(10);
 		if (getch() != ERR)
 			early_quit(0, "No servers could be used! Exiting.");

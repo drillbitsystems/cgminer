@@ -204,7 +204,7 @@ char *opt_klondike_options = NULL;
 #endif
 #ifdef USE_DRILLBIT
 char *opt_drillbit_options = NULL;
-bool opt_drillbit_autotune = false;
+char *opt_drillbit_auto = NULL;
 #endif
 char *opt_bab_options = NULL;
 #ifdef USE_BITMINE_A1
@@ -1123,6 +1123,14 @@ static char *set_drillbit_options(const char *arg)
 
 	return NULL;
 }
+
+static char *set_drillbit_auto(const char *arg)
+{
+	opt_set_charp(arg, &opt_drillbit_auto);
+
+	return NULL;
+}
+
 #endif
 
 #ifdef USE_BAB
@@ -1287,11 +1295,11 @@ static struct opt_table opt_config_table[] = {
 			"Automatically disable pools that continually reject shares"),
 #ifdef USE_DRILLBIT
         OPT_WITH_ARG("--drillbit-options",
-                     set_drillbit_options, NULL, NULL,
-                     "Set drillbit options <int|ext>:clock[:clock_divider][:voltage]"),
-        OPT_WITHOUT_ARG("--drillbit-autotune",
-                        opt_set_bool, &opt_drillbit_autotune,
-                        "Enable drillbit automatic clock speed tuning"),
+		set_drillbit_options, NULL, NULL,
+		"Set drillbit options <int|ext>:clock[:clock_divider][:voltage]"),
+        OPT_WITH_ARG("--drillbit-auto",
+		set_drillbit_auto, NULL, NULL,
+		"Enable drillbit automatic tuning <every>:[<gooderr>:<baderr>:<maxerr>]"),
 #endif
 	OPT_WITH_ARG("--expiry|-E",
 		     set_int_0_to_9999, opt_show_intval, &opt_expiry,
@@ -4719,6 +4727,8 @@ void write_config(FILE *fcfg)
 #ifdef USE_DRILLBIT
         if (opt_drillbit_options)
                 fprintf(fcfg, ",\n\"drillbit-options\" : \"%s\"", json_escape(opt_drillbit_options));
+	if (opt_drillbit_auto)
+                fprintf(fcfg, ",\n\"drillbit-auto\" : \"%s\"", json_escape(opt_drillbit_auto));
 #endif
 	if (opt_bab_options)
 		fprintf(fcfg, ",\n\"bab-options\" : \"%s\"", json_escape(opt_bab_options));

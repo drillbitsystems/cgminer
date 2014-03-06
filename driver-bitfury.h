@@ -25,6 +25,7 @@
 
 extern int opt_bxf_temp_target;
 extern int opt_nf1_bits;
+extern int opt_bxm_bits;
 
 #define NF1_PIN_LED 0
 #define NF1_PIN_SCK_OVR 5
@@ -32,6 +33,20 @@ extern int opt_nf1_bits;
 
 #define SPIBUF_SIZE 16384
 #define BITFURY_REFRESH_DELAY 100
+
+#define SIO_RESET_REQUEST 0
+#define SIO_SET_LATENCY_TIMER_REQUEST 0x09
+#define SIO_SET_EVENT_CHAR_REQUEST    0x06
+#define SIO_SET_ERROR_CHAR_REQUEST    0x07
+#define SIO_SET_BITMODE_REQUEST       0x0B
+#define SIO_RESET_PURGE_RX 1
+#define SIO_RESET_PURGE_TX 2
+
+#define BITMODE_RESET 0x00
+#define BITMODE_MPSSE 0x02
+#define SIO_RESET_SIO 0
+
+#define BXM_LATENCY_MS 2
 
 struct bitfury_payload {
 	unsigned char midstate[32];
@@ -82,14 +97,14 @@ struct bitfury_info {
 	char spibuf[SPIBUF_SIZE];
 	unsigned int spibufsz;
 	int osc6_bits;
-	struct bitfury_payload payload;
-	struct bitfury_payload opayload;
-	unsigned newbuf[17];
-	unsigned oldbuf[17];
-	bool job_switched;
-	bool second_run;
-	struct work *work;
-	struct work *owork;
+	struct bitfury_payload payload[2];
+	unsigned oldbuf[17 * 2];
+	bool job_switched[2];
+	bool second_run[2];
+	struct work *work[2];
+	struct work *owork[2];
+
+	bool (*spi_txrx)(struct cgpu_info *, struct bitfury_info *info);
 };
 
 #endif /* BITFURY_H */

@@ -88,6 +88,10 @@ char *curly = ":D";
 #include "driver-hashfast.h"
 #endif
 
+#ifdef USE_ANT_S1
+#include "driver-bitmain.h"
+#endif
+
 #if defined(USE_BITFORCE) || defined(USE_ICARUS) || defined(USE_AVALON) || defined(USE_AVALON2) || defined(USE_MODMINER)
 #	define USE_FPGA
 #endif
@@ -209,6 +213,9 @@ char *opt_drillbit_auto = NULL;
 char *opt_bab_options = NULL;
 #ifdef USE_BITMINE_A1
 char *opt_bitmine_a1_options = NULL;
+#endif
+#ifdef USE_ANT_S1
+char *opt_bitmain_options = NULL;
 #endif
 #ifdef USE_USBUTILS
 char *opt_usb_select = NULL;
@@ -361,7 +368,7 @@ struct sigaction termhandler, inthandler;
 
 struct thread_q *getq;
 
-static int total_work;
+static uint32_t total_work;
 struct work *staged_work = NULL;
 
 struct schedtime {
@@ -1223,6 +1230,17 @@ static struct opt_table opt_config_table[] = {
 		     set_int_0_to_100, opt_show_intval, &opt_avalon_temp,
 		     "Set avalon target temperature"),
 #endif
+#ifdef USE_AVALON2
+	OPT_WITH_ARG("--avalon2-freq",
+		     set_avalon2_freq, NULL, NULL,
+		     "Set frequency range for Avalon2, single value or range"),
+	OPT_WITH_ARG("--avalon2-fan",
+		     set_avalon2_fan, NULL, NULL,
+		     "Set Avalon2 target fan speed"),
+	OPT_WITH_ARG("--avalon2-voltage",
+		     set_avalon2_voltage, NULL, NULL,
+		     "Set Avalon2 core voltage, in millivolts"),
+#endif
 #ifdef USE_BAB
 	OPT_WITH_ARG("--bab-options",
 		     set_bab_options, NULL, NULL,
@@ -1261,6 +1279,29 @@ static struct opt_table opt_config_table[] = {
 		     set_bitburner_fury_options, NULL, NULL,
 		     "Override avalon-options for BitBurner Fury boards baud:miners:asic:timeout:freq"),
 #endif
+#ifdef USE_ANT_S1
+	OPT_WITHOUT_ARG("--bitmain-auto",
+			opt_set_bool, &opt_bitmain_auto,
+			"Adjust bitmain overclock frequency dynamically for best hashrate"),
+	OPT_WITH_ARG("--bitmain-cutoff",
+		     set_int_0_to_100, opt_show_intval, &opt_bitmain_overheat,
+		     "Set bitmain overheat cut off temperature"),
+	OPT_WITH_ARG("--bitmain-fan",
+		     set_bitmain_fan, NULL, NULL,
+		     "Set fanspeed percentage for bitmain, single value or range (default: 20-100)"),
+	OPT_WITH_ARG("--bitmain-freq",
+		     set_bitmain_freq, NULL, NULL,
+		     "Set frequency range for bitmain-auto, single value or range"),
+	OPT_WITHOUT_ARG("--bitmain-hwerror",
+			opt_set_bool, &opt_bitmain_hwerror,
+			"Set bitmain device detect hardware error"),
+	OPT_WITH_ARG("--bitmain-options",
+		     opt_set_charp, NULL, &opt_bitmain_options,
+		     "Set bitmain options baud:miners:asic:timeout:freq"),
+	OPT_WITH_ARG("--bitmain-temp",
+		     set_int_0_to_100, opt_show_intval, &opt_bitmain_temp,
+		     "Set bitmain target temperature"),
+#endif
 #ifdef USE_BITMINE_A1
 	OPT_WITH_ARG("--bitmine-a1-options",
 		     set_bitmine_a1_options, NULL, NULL,
@@ -1270,6 +1311,9 @@ static struct opt_table opt_config_table[] = {
 	OPT_WITH_ARG("--bxf-temp-target",
 		     set_int_0_to_200, opt_show_intval, &opt_bxf_temp_target,
 		     "Set target temperature for BXF devices"),
+	OPT_WITH_ARG("--bxm-bits",
+		     set_int_0_to_100, opt_show_intval, &opt_bxm_bits,
+		     "Set BXM bits for overclocking"),
 #endif
 #ifdef HAVE_CURSES
 	OPT_WITHOUT_ARG("--compact",
@@ -1362,17 +1406,6 @@ static struct opt_table opt_config_table[] = {
 	OPT_WITH_ARG("--kernel-path|-K",
 		     opt_set_charp, opt_show_charp, &opt_kernel_path,
 	             "Specify a path to where bitstream files are"),
-#endif
-#ifdef USE_AVALON2
-	OPT_WITH_ARG("--avalon2-freq",
-		     set_avalon2_freq, NULL, NULL,
-		     "Set frequency range for Avalon2, single value or range"),
-	OPT_WITH_ARG("--avalon2-fan",
-		     set_avalon2_fan, NULL, NULL,
-		     "Set Avalon2 target fan speed"),
-	OPT_WITH_ARG("--avalon2-voltage",
-		     set_avalon2_voltage, NULL, NULL,
-		     "Set Avalon2 core voltage, in millivolts"),
 #endif
 #ifdef USE_KLONDIKE
 	OPT_WITH_ARG("--klondike-options",
@@ -1656,6 +1689,9 @@ extern const char *opt_argv0;
 static char *opt_verusage_and_exit(const char *extra)
 {
 	printf("%s\nBuilt with "
+#ifdef USE_ANT_S1
+		"ant.S1 "
+#endif
 #ifdef USE_AVALON
 		"avalon "
 #endif
@@ -3539,7 +3575,7 @@ static void __kill_work(void)
 /* This should be the common exit path */
 void kill_work(void)
 {
-	__kill_work();
+	cg_completion_timeout(&__kill_work, NULL, 5000);
 
 	quit(0, "Shutdown signal received.");
 }
@@ -3556,7 +3592,7 @@ void app_restart(void)
 {
 	applog(LOG_WARNING, "Attempting to restart %s", packagename);
 
-	__kill_work();
+	cg_completion_timeout(&__kill_work, NULL, 5000);
 	clean_up(true);
 
 #if defined(unix) || defined(__APPLE__)
@@ -3841,7 +3877,7 @@ static char *offset_ntime(const char *ntime, int noffset)
  * prevent a copied work struct from freeing ram belonging to another struct */
 static void _copy_work(struct work *work, const struct work *base_work, int noffset)
 {
-	int id = work->id;
+	uint32_t id = work->id;
 
 	clean_work(work);
 	memcpy(work, base_work, sizeof(struct work));
@@ -7038,6 +7074,35 @@ struct work *clone_queued_work_bymidstate(struct cgpu_info *cgpu, char *midstate
 	return ret;
 }
 
+/* This function is for finding an already queued work item in the
+ * given que hashtable. Code using this function must be able
+ * to handle NULL as a return which implies there is no matching work.
+ * The calling function must lock access to the que if it is required. */
+struct work *__find_work_byid(struct work *que, uint32_t id)
+{
+	struct work *work, *tmp, *ret = NULL;
+
+	HASH_ITER(hh, que, work, tmp) {
+		if (work->id == id) {
+			ret = work;
+			break;
+		}
+	}
+
+	return ret;
+}
+
+struct work *find_queued_work_byid(struct cgpu_info *cgpu, uint32_t id)
+{
+	struct work *ret;
+
+	rd_lock(&cgpu->qlock);
+	ret = __find_work_byid(cgpu->queued_work, id);
+	rd_unlock(&cgpu->qlock);
+
+	return ret;
+}
+
 void __work_completed(struct cgpu_info *cgpu, struct work *work)
 {
 	cgpu->queued_count--;
@@ -7905,8 +7970,24 @@ static void clean_up(bool restarting)
 	curl_global_cleanup();
 }
 
+/* Should all else fail and we're unable to clean up threads due to locking
+ * issues etc, just silently exit. */
+static void *killall_thread(void __maybe_unused *arg)
+{
+	pthread_detach(pthread_self());
+	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+	sleep(5);
+	exit(1);
+	return NULL;
+}
+
 void __quit(int status, bool clean)
 {
+	pthread_t killall_t;
+
+	if (unlikely(pthread_create(&killall_t, NULL, killall_thread, NULL)))
+		exit(1);
+
 	if (clean)
 		clean_up(false);
 #ifdef HAVE_CURSES
@@ -7920,6 +8001,7 @@ void __quit(int status, bool clean)
 		forkpid = 0;
 	}
 #endif
+	pthread_cancel(killall_t);
 
 	exit(status);
 }
